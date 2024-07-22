@@ -18,14 +18,6 @@
  */
 package org.apache.iceberg.flink.source;
 
-import static org.assertj.core.api.Assertions.assertThat;
-
-import java.io.File;
-import java.io.IOException;
-import java.time.Duration;
-import java.util.Arrays;
-import java.util.List;
-import java.util.stream.Collectors;
 import org.apache.flink.api.common.RuntimeExecutionMode;
 import org.apache.flink.api.common.functions.RichMapFunction;
 import org.apache.flink.api.common.typeinfo.Types;
@@ -43,13 +35,23 @@ import org.apache.flink.table.api.TableEnvironment;
 import org.apache.flink.table.api.bridge.java.StreamTableEnvironment;
 import org.apache.flink.test.junit5.MiniClusterExtension;
 import org.apache.flink.types.Row;
+import org.apache.iceberg.flink.FlinkConfigOptions;
 import org.apache.iceberg.flink.TestBase;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.RegisterExtension;
 
-public class TestIcebergSourceWithSpeculativeExecutionSupport extends TestBase {
+import java.io.IOException;
+import java.nio.file.Files;
+import java.time.Duration;
+import java.util.Arrays;
+import java.util.List;
+import java.util.stream.Collectors;
+
+import static org.assertj.core.api.Assertions.assertThat;
+
+public class TestIcebergSpeculativeExecutionSupport extends TestBase {
   private static final int NUM_TASK_MANAGERS = 1;
   private static final int NUM_TASK_SLOTS = 3;
 
@@ -72,24 +74,26 @@ public class TestIcebergSourceWithSpeculativeExecutionSupport extends TestBase {
   protected TableEnvironment getTableEnv() {
     if (tEnv == null) {
       synchronized (this) {
-        StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+        StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment(configure());
         env.setRuntimeMode(RuntimeExecutionMode.BATCH);
         tEnv = StreamTableEnvironment.create(env);
       }
     }
+
     return tEnv;
   }
 
   @BeforeEach
   public void before() throws IOException {
     String warehouse =
-        String.format("file:%s", File.createTempFile("junit", null, temporaryDirectory.toFile()));
+        String.format("file:%s", Files.createTempDirectory(temporaryDirectory, "junit").toString());
     sql(
         "CREATE CATALOG %s WITH ('type'='iceberg', 'catalog-type'='hadoop', 'warehouse'='%s')",
         CATALOG_NAME, warehouse);
     sql("USE CATALOG %s", CATALOG_NAME);
     sql("CREATE DATABASE %s", DATABASE_NAME);
     sql("USE %s", DATABASE_NAME);
+
     sql("CREATE TABLE %s (i INT, j INT)", INPUT_TABLE_NAME);
     sql("INSERT INTO %s VALUES (1, -1),(2, -1),(3, -1)", INPUT_TABLE_NAME);
     sql("CREATE TABLE %s (i INT, j INT, subTask INT, attempt INT)", OUTPUT_TABLE_NAME);
@@ -126,16 +130,17 @@ public class TestIcebergSourceWithSpeculativeExecutionSupport extends TestBase {
 
     List<Row> output = sql(String.format("SELECT * FROM %s.%s", DATABASE_NAME, OUTPUT_TABLE_NAME));
 
-    // Ensure at least one subTask has attemptNum > 0
-    assertThat(output.stream().map(x -> x.getField(3)).collect(Collectors.toSet())).contains(0, 1);
+    // Ensure that all subTasks has attemptNum > 0
+    assertThat(output.stream().map(x -> x.getField(3))
+            .collect(Collectors.toSet())).contains(1);
 
     // Ensure the test_table rows are returned exactly the same after the slow map task from the
     // sink_table
     assertSameElements(
-        Arrays.asList(Row.of(1, -1), Row.of(2, -1), Row.of(3, -1)),
         output.stream()
             .map(x -> Row.of(x.getField(0), x.getField(1)))
-            .collect(Collectors.toList()));
+            .collect(Collectors.toList()),
+        Arrays.asList(Row.of(1, -1), Row.of(2, -1), Row.of(3, -1)));
   }
 
   /** A testing map function that simulates the slow task. */
@@ -144,8 +149,7 @@ public class TestIcebergSourceWithSpeculativeExecutionSupport extends TestBase {
     public Row map(Row row) throws Exception {
       // Put the even subtask indices with the first attempt to sleep to trigger speculative
       // execution
-      if (getRuntimeContext().getTaskInfo().getIndexOfThisSubtask() % 2 != 0
-          && getRuntimeContext().getTaskInfo().getAttemptNumber() <= 0) {
+      if (getRuntimeContext().getTaskInfo().getAttemptNumber() <= 0) {
         Thread.sleep(Integer.MAX_VALUE);
       }
 
@@ -166,6 +170,9 @@ public class TestIcebergSourceWithSpeculativeExecutionSupport extends TestBase {
     configuration.set(RestOptions.BIND_PORT, "0");
     configuration.set(JobManagerOptions.SLOT_REQUEST_TIMEOUT, 5000L);
 
+    // Use FLIP-27 source
+    configuration.set(FlinkConfigOptions.TABLE_EXEC_ICEBERG_USE_FLIP27_SOURCE, true);
+
     // for speculative execution
     configuration.set(BatchExecutionOptions.SPECULATIVE_ENABLED, true);
 
@@ -174,6 +181,7 @@ public class TestIcebergSourceWithSpeculativeExecutionSupport extends TestBase {
     configuration.set(
         SlowTaskDetectorOptions.EXECUTION_TIME_BASELINE_LOWER_BOUND, Duration.ofMillis(0));
     configuration.set(BatchExecutionOptions.BLOCK_SLOW_NODE_DURATION, Duration.ofMillis(0));
+
     return configuration;
   }
 }
